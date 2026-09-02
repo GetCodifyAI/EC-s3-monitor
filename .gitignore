@@ -1,1 +1,19 @@
+# Terraform state — never commit
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+.terraform/
+.terraform.tfstate.lock.info
+
+# Generated build artifact
+terraform/build/
+
+# Local runner state
+local/.feed-monitor-state.json
+
+# Python
+__pycache__/
+*.pyc
+
+# macOS
 .DS_Store
