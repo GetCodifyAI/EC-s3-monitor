@@ -179,7 +179,26 @@ The stack creates its own execution role. Six statements:
 | `kms:Decrypt` | `*`, conditioned to `ssm.us-east-2` |
 | `logs:CreateLogStream`, `logs:PutLogEvents` | its own log group |
 
-Deploying needs `CAPABILITY_IAM` and permission to create the Lambda, role, log
-group, EventBridge rule, SSM parameter and (optionally) two alarms. If the
-`aws-infra` pipeline role already deploys the RDS and EC2 monitors, it covers
-this — no new permission request.
+### Deploy permissions
+
+Two routes, and they need different things.
+
+**Via the `aws-infra` pipeline** — if that pipeline's role already deploys the
+RDS and EC2 monitors, it covers this stack too. No new permission request.
+
+**Deploying by hand** — `deploy-policy.json` in this folder is the minimum
+policy. 13 statements, every one scoped to `s3-feed-freshness*` in us-east-2,
+`PassRole` conditioned to `lambda.amazonaws.com`. Administrator access is not
+required. Replace `REPLACE-WITH-ARTIFACT-BUCKET` with the bucket used for
+`aws cloudformation package` before attaching.
+
+```bash
+aws iam create-policy --policy-name s3-feed-freshness-deploy \
+  --policy-document file://cfn/deploy-policy.json
+aws iam attach-user-policy --user-name eniyavant \
+  --policy-arn arn:aws:iam::057311931122:policy/s3-feed-freshness-deploy
+```
+
+Confirmed as of 09/03/26: user `eniyavant` has no CloudFormation access at all —
+even `cloudformation:ValidateTemplate` is denied — so one of these two routes is
+mandatory before any deploy step will work.
