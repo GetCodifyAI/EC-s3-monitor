@@ -66,19 +66,38 @@ variable "schedule_expression" {
   default     = "cron(0 15 * * ? *)"
 }
 
-variable "webhook_source" {
-  description = "Where the Lambda reads the Slack webhook from: secretsmanager | ssm | env"
+variable "slack_source" {
+  description = <<-EOT
+    How the Lambda authenticates to Slack.
+      bot_token_ssm  - SSM SecureString holding a xoxb- Bot User OAuth Token (preferred).
+                       Posts via chat.postMessage to var.slack_channel_id.
+      webhook_ssm    - SSM SecureString holding an incoming webhook URL.
+      webhook_secret - Secrets Manager holding an incoming webhook URL.
+      env            - plain Lambda env var (webhook URL). Development only.
+  EOT
   type        = string
-  default     = "ssm"
+  default     = "bot_token_ssm"
 
   validation {
-    condition     = contains(["secretsmanager", "ssm", "env"], var.webhook_source)
-    error_message = "webhook_source must be secretsmanager, ssm, or env."
+    condition     = contains(["bot_token_ssm", "webhook_ssm", "webhook_secret", "env"], var.slack_source)
+    error_message = "slack_source must be bot_token_ssm, webhook_ssm, webhook_secret, or env."
   }
 }
 
+variable "slack_channel_id" {
+  description = "Slack channel ID the bot posts to. Required when slack_source = bot_token_ssm."
+  type        = string
+  default     = "C04F7EJU5PB" # #dam-alerts
+}
+
+variable "slack_app_name" {
+  description = "Shown in the not_in_channel error hint so the runbook step is obvious in the logs."
+  type        = string
+  default     = "S3 Feed Monitor"
+}
+
 variable "webhook_url" {
-  description = "Only used when webhook_source = env. Pass via TF_VAR_webhook_url, never a committed tfvars."
+  description = "Only used when slack_source = env. Pass via TF_VAR_webhook_url, never a committed tfvars."
   type        = string
   default     = ""
   sensitive   = true
@@ -99,11 +118,22 @@ data "aws_caller_identity" "current" {}
 locals {
   name = "s3-feed-monitor-${var.monitor_id}"
 
-  webhook_env = (
-    var.webhook_source == "secretsmanager"
-    ? { SLACK_SECRET_ARN = aws_secretsmanager_secret.slack[0].arn }
-    : var.webhook_source == "ssm"
+  use_bot_token = var.slack_source == "bot_token_ssm"
+  use_ssm       = contains(["bot_token_ssm", "webhook_ssm"], var.slack_source)
+
+  ssm_param_name = local.use_bot_token ? "/${local.name}/slack-bot-token" : "/${local.name}/slack-webhook"
+
+  slack_env = (
+    var.slack_source == "bot_token_ssm"
+    ? {
+      SLACK_BOT_TOKEN_SSM = aws_ssm_parameter.slack[0].name
+      SLACK_CHANNEL       = var.slack_channel_id
+      SLACK_APP_NAME      = var.slack_app_name
+    }
+    : var.slack_source == "webhook_ssm"
     ? { SLACK_SSM_PARAM = aws_ssm_parameter.slack[0].name }
+    : var.slack_source == "webhook_secret"
+    ? { SLACK_SECRET_ARN = aws_secretsmanager_secret.slack[0].arn }
     : { SLACK_WEBHOOK_URL = var.webhook_url }
   )
 }
@@ -112,7 +142,7 @@ locals {
 # Created empty on purpose: put the webhook in with the CLI so it never
 # lands in Terraform state or a .tfvars file.
 resource "aws_secretsmanager_secret" "slack" {
-  count       = var.webhook_source == "secretsmanager" ? 1 : 0
+  count       = var.slack_source == "webhook_secret" ? 1 : 0
   name        = "${local.name}/slack-webhook"
   description = "Slack incoming webhook URL for ${var.monitor_id} feed alerts"
   tags        = var.tags
@@ -121,11 +151,12 @@ resource "aws_secretsmanager_secret" "slack" {
 # SSM SecureString alternative. Value is set out of band with the CLI, so
 # lifecycle ignores it and it never enters Terraform state.
 resource "aws_ssm_parameter" "slack" {
-  count  = var.webhook_source == "ssm" ? 1 : 0
-  name   = "/${local.name}/slack-webhook"
-  type   = "SecureString"
-  value  = "PLACEHOLDER_SET_VIA_CLI"
-  tags   = var.tags
+  count       = local.use_ssm ? 1 : 0
+  name        = local.ssm_param_name
+  description = local.use_bot_token ? "Slack bot token (xoxb-) for ${var.monitor_id}" : "Slack incoming webhook for ${var.monitor_id}"
+  type        = "SecureString"
+  value       = "PLACEHOLDER_SET_VIA_CLI"
+  tags        = var.tags
 
   lifecycle {
     ignore_changes = [value]
@@ -206,10 +237,10 @@ resource "aws_iam_role_policy" "lambda" {
   policy = data.aws_iam_policy_document.lambda.json
 }
 
-# Webhook-read permission, only for the source actually in use.
-# webhook_source = "env" needs no extra IAM at all.
+# Credential-read permission, only for the source actually in use.
+# slack_source = "env" needs no extra IAM at all.
 resource "aws_iam_role_policy" "webhook_secretsmanager" {
-  count = var.webhook_source == "secretsmanager" ? 1 : 0
+  count = var.slack_source == "webhook_secret" ? 1 : 0
   name  = "${local.name}-read-secret"
   role  = aws_iam_role.lambda.id
   policy = jsonencode({
@@ -223,7 +254,7 @@ resource "aws_iam_role_policy" "webhook_secretsmanager" {
 }
 
 resource "aws_iam_role_policy" "webhook_ssm" {
-  count = var.webhook_source == "ssm" ? 1 : 0
+  count = local.use_ssm ? 1 : 0
   name  = "${local.name}-read-parameter"
   role  = aws_iam_role.lambda.id
   policy = jsonencode({
@@ -232,7 +263,7 @@ resource "aws_iam_role_policy" "webhook_ssm" {
       {
         Effect   = "Allow"
         Action   = "ssm:GetParameter"
-        Resource = "arn:aws:ssm:${var.region}:${data.aws_caller_identity.current.account_id}:parameter/${local.name}/slack-webhook"
+        Resource = "arn:aws:ssm:${var.region}:${data.aws_caller_identity.current.account_id}:parameter${local.ssm_param_name}"
       },
       # SecureString decryption via the account's default SSM key. Scoped by
       # ViaService because kms:Decrypt cannot target an alias ARN directly.
@@ -274,7 +305,7 @@ resource "aws_lambda_function" "monitor" {
   memory_size      = 256
 
   environment {
-    variables = merge(local.webhook_env, {
+    variables = merge(local.slack_env, {
       BUCKET             = var.bucket
       PREFIX             = var.prefix
       SUFFIX             = var.suffix
@@ -360,13 +391,25 @@ output "function_name" {
 }
 
 output "webhook_secret_arn" {
-  description = "Empty unless webhook_source = secretsmanager"
+  description = "Empty unless slack_source = webhook_secret"
   value       = try(aws_secretsmanager_secret.slack[0].arn, "")
 }
 
-output "webhook_ssm_param" {
-  description = "Empty unless webhook_source = ssm"
+output "slack_ssm_param" {
+  description = "SSM parameter to load the Slack credential into. Empty unless slack_source uses SSM."
   value       = try(aws_ssm_parameter.slack[0].name, "")
+}
+
+output "slack_channel_id" {
+  value = local.use_bot_token ? var.slack_channel_id : "(webhook-bound)"
+}
+
+output "state_table" {
+  value = aws_dynamodb_table.state.name
+}
+
+output "log_group" {
+  value = aws_cloudwatch_log_group.lambda.name
 }
 
 output "health_topic_arn" {
