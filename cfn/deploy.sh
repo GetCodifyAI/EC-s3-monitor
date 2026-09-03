@@ -28,7 +28,7 @@ echo "==> deploying $STACK (DryRun=$DRY_RUN)"
 aws cloudformation deploy \
   --template-file .packaged.yaml \
   --stack-name "$STACK" \
-  --capabilities CAPABILITY_IAM \
+  --capabilities CAPABILITY_IAM CAPABILITY_AUTO_EXPAND \
   --region "$REGION" \
   --parameter-overrides \
       DryRun="$DRY_RUN" \

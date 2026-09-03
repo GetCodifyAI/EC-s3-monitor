@@ -42,15 +42,22 @@ It reports both the per-feed timestamp and the newest file across all feeds.
 
 ## First deployment
 
-### 1. Confirm the webhook parameter
+### 1. Confirm the webhook parameter exists
 
-The Lambda reads the platform webhook from an SSM SecureString. Confirm the name
-and that it posts to #dam-alerts:
+The Lambda reads the platform webhook from an SSM SecureString.
+`/platform/slack/webhook-dam-alerts` is this stack's **default, not a verified
+fact** — see [Open questions](#open-questions). Confirm the real path by name:
 
 ```bash
-aws ssm get-parameter --name /platform/slack/webhook-dam-alerts \
-  --with-decryption --region us-east-2 --query 'Parameter.Value' --output text
+aws ssm describe-parameters --region us-east-2 \
+  --query 'Parameters[?starts_with(Name, `/platform/slack/`)].[Name,Type]' \
+  --output table
 ```
+
+`describe-parameters` returns names and types, never values, and is the only SSM
+read the deploy policy grants against this path — deliberately, so deploying
+the monitor never requires a human to read the webhook secret. Proving the value
+is *readable and well-formed* is the dry run's job (step 3).
 
 If the platform webhook lives under a different path, pass
 `SLACK_WEBHOOK_PARAM=/your/path` to `deploy.sh`.
@@ -78,6 +85,19 @@ aws logs tail "/aws/lambda/$FN" --since 10m --region us-east-2 | grep -A30 "DRY_
 
 Check the feed list is right, the thresholds are right, and the message reads
 the way you want it to in a busy channel.
+
+Then check `webhook_check` in the returned JSON:
+
+```json
+"webhook_check": {"parameter": "/platform/slack/webhook-dam-alerts",
+                  "ok": true, "detail": "hooks.slack.com"}
+```
+
+`ok: false` means the parameter path is wrong, the runtime role cannot read it,
+or the value is not a Slack webhook URL — all of which would otherwise stay
+hidden until the moment you flipped `DryRun` to `false` and the first real alert
+was due. The check runs on every dry run, including a clean one where no feed is
+stale, and it logs only the host, never the URL.
 
 ### 4. Go live
 
@@ -187,9 +207,26 @@ Two routes, and they need different things.
 RDS and EC2 monitors, it covers this stack too. No new permission request.
 
 **Deploying by hand** — `deploy-policy.json` in this folder is the minimum
-policy. 13 statements, every one scoped to `s3-feed-freshness*` in us-east-2,
+policy. 15 statements, every one scoped to `s3-feed-freshness*` in us-east-2,
 `PassRole` conditioned to `lambda.amazonaws.com`. Administrator access is not
 required.
+
+Two of those statements are not about this stack's resources, and are the two
+easiest to leave out by accident:
+
+- `TemplateInspectionIsNotResourceScopable` — `ValidateTemplate` and
+  `GetTemplateSummary` take no resource ARN, so they can only be granted on `*`.
+- `AllowTheServerlessTransform` — the template's `Transform:
+  AWS::Serverless-2016-10-31` is a macro CloudFormation hosts, and expanding it
+  is authorised as `cloudformation:CreateChangeSet` against
+  `arn:aws:cloudformation:us-east-2:aws:transform/Serverless-2016-10-31`, not
+  against the stack. Without it the deploy fails during expansion with an
+  AccessDenied naming the transform rather than anything in this repo.
+
+`deploy.sh` passes `CAPABILITY_IAM CAPABILITY_AUTO_EXPAND`. The IAM capability
+is for the execution role; the auto-expand one is for that same SAM transform.
+Change-set deploys do not always demand it and stack-level ones do, and it is
+inert when unnecessary — so it is always passed rather than diagnosed.
 
 The policy provisions its own artifact bucket,
 `s3-feed-freshness-artifacts-057311931122`, so there is no dependency on
@@ -213,3 +250,31 @@ aws iam attach-user-policy --user-name eniyavant \
 Confirmed as of 09/03/26: user `eniyavant` has no CloudFormation access at all —
 even `cloudformation:ValidateTemplate` is denied — so one of these two routes is
 mandatory before any deploy step will work.
+
+---
+
+## Open questions
+
+Three things this repo assumes that nothing has confirmed. Each is a parameter,
+so none of them blocks writing the code — but the first two decide whether the
+first live run reaches anybody.
+
+**1. The platform webhook's real SSM path.** `/platform/slack/webhook-dam-alerts`
+is a placeholder chosen to look like the thing it stands for. No parameter under
+`/platform/slack/` has been confirmed to exist. Step 1 above finds the real one;
+step 3 proves the monitor can read it.
+
+**2. The channel.** The existing platform monitors — RDS zero-connections, the
+staging-env reaper, the access-key rotation enforcer — all post to
+**#platform-team**, where the platform engineers read them and reply in thread.
+**#dam-alerts** is where the DAM application's own job log goes: import started,
+import completed, brand sync finished, dozens of machine messages a day and no
+human replies. A feed-staleness alert posted there is unlikely to be read. Worth
+settling before go-live; it is one parameter either way.
+
+**3. Whether `aws-infra` exists.** The preferred route hands this folder to that
+repo's pipeline, which needs no IAM grant to anyone. The repo name appears
+exactly once anywhere searchable — in the message proposing this design —
+so its existence, its pipeline, and that pipeline's permissions are all
+unconfirmed. If it does not exist, the hand-deploy route and its policy are the
+only path.

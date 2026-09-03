@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
@@ -174,6 +175,22 @@ def _post(text):
         ) from exc
 
 
+def _check_webhook():
+    """
+    Dry-run credential check. Resolves the webhook parameter without posting, so
+    a wrong parameter path, a missing ssm:GetParameter or a value that is not a
+    Slack webhook surfaces during the dry run instead of the moment the monitor
+    goes live. Never logs the URL itself - only its host.
+    """
+    try:
+        host = urllib.parse.urlsplit(_webhook()).netloc
+    except Exception as exc:  # noqa: BLE001 - reported, never raised
+        LOG.error("Webhook check FAILED for %s: %s", WEBHOOK_PARAM, exc)
+        return {"parameter": WEBHOOK_PARAM, "ok": False, "detail": str(exc)[:200]}
+    LOG.info("Webhook check OK: %s resolves to %s", WEBHOOK_PARAM, host)
+    return {"parameter": WEBHOOK_PARAM, "ok": True, "detail": host}
+
+
 # ------------------------------------------------------------- message text
 def _unit():
     return "business days" if BUSINESS_DAYS_ONLY else "days"
@@ -286,10 +303,15 @@ def lambda_handler(event, context):
 
     _save_state(new_state)
 
+    # A clean dry run must still prove the webhook is reachable, otherwise the
+    # only thing it proves is that nothing was stale.
+    webhook_check = _check_webhook() if DRY_RUN else None
+
     summary = {
         "monitor_id": MONITOR_ID,
         "bucket": BUCKET,
         "dry_run": DRY_RUN,
+        "webhook_check": webhook_check,
         "feeds_checked": len(FEEDS),
         "feeds_stale": sum(1 for r in results if r["status"] == "STALE"),
         "newest_file_overall": overall_ts.isoformat() if overall_ts else None,

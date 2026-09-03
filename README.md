@@ -86,6 +86,11 @@ object later.
 and buys transition-only alerting plus a recovery message. Without it a stale
 feed alerts every day of an outage and recovery is never reported.
 
+**The dry run checks the webhook.** Resolving the webhook parameter is the one
+step a clean dry run would otherwise skip entirely, and it is the assumption most
+likely to be wrong. Every dry run resolves it, reports `webhook_check` in the
+summary, and logs the host only — never the URL.
+
 **A failed Slack post raises.** That increments the Lambda `Errors` metric and
 trips the alarm. A monitor that swallows its own delivery failures looks exactly
 like a healthy feed.

@@ -13,7 +13,7 @@ Slack is always dry-run here: the exact text is printed, never posted.
   python3 cfn/run_local.py --offline --scenario recovered
   python3 cfn/run_local.py
 """
-import argparse, json, os, sys
+import argparse, json, logging, os, sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -66,6 +66,14 @@ def main():
     for k, v in DEFAULTS.items():
         os.environ.setdefault(k, v)
 
+    # Without a handler the root logger drops INFO on the floor, and the whole
+    # point of this harness is to SEE the message the monitor would post.
+    logging.basicConfig(
+        level=os.environ.get("LOG_LEVEL", "INFO"),
+        format="%(levelname)s %(message)s",
+        stream=sys.stdout,
+    )
+
     if args.reset:
         STATE_FILE.write_text("{}")
 
@@ -79,6 +87,9 @@ def main():
 
     monitor._load_state = load
     monitor._save_state = save
+    # Never resolve the real SSM parameter here; the dry-run webhook check
+    # would otherwise reach for AWS credentials the harness promises not to need.
+    monitor._webhook = lambda: "https://hooks.slack.com/services/T000/B000/offline-stub"
 
     if args.offline:
         ages = SCENARIOS[args.scenario]

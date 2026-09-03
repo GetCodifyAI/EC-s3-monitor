@@ -26,7 +26,8 @@ aws iam attach-user-policy --user-name eniyavant \
 ```
 
 **Administrator access is not required.** The policy is in this repo at
-`cfn/deploy-policy.json` — 14 statements, 4,137 characters.
+`cfn/deploy-policy.json` — 15 statements, 4,316 characters minified,
+against IAM's 6,144-character managed-policy limit.
 
 ## Why it is safe to approve
 
@@ -42,6 +43,9 @@ aws iam attach-user-policy --user-name eniyavant \
   statements: list one prefix, read/write its own SSM watermark, read the Slack
   webhook parameter, decrypt via SSM, and write its own logs. It cannot read a
   single row of vendor data.
+- **No secret access.** Against the Slack webhook parameter the deploy policy
+  grants `DescribeParameters` — names and types, not values. The deployed
+  Lambda reads the webhook; the person deploying it never does.
 - **Deploys inert.** `DryRun` defaults to `true`; the Lambda logs the message it
   would post and sends nothing until that is flipped.
 

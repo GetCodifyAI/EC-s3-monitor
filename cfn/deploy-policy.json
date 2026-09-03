@@ -33,6 +33,12 @@
       "Resource": "*"
     },
     {
+      "Sid": "AllowTheServerlessTransform",
+      "Effect": "Allow",
+      "Action": "cloudformation:CreateChangeSet",
+      "Resource": "arn:aws:cloudformation:us-east-2:aws:transform/Serverless-2016-10-31"
+    },
+    {
       "Sid": "ManageMonitorRole",
       "Effect": "Allow",
       "Action": [
