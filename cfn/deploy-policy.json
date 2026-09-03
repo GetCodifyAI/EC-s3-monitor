@@ -56,7 +56,9 @@
       "Action": "iam:PassRole",
       "Resource": "arn:aws:iam::057311931122:role/s3-feed-freshness-*",
       "Condition": {
-        "StringEquals": { "iam:PassedToService": "lambda.amazonaws.com" }
+        "StringEquals": {
+          "iam:PassedToService": "lambda.amazonaws.com"
+        }
       }
     },
     {
@@ -155,19 +157,39 @@
       "Resource": "arn:aws:cloudwatch:us-east-2:057311931122:alarm:s3-feed-freshness*"
     },
     {
-      "Sid": "UploadTheLambdaZipToTheArtifactBucket",
+      "Sid": "CreateAndUseTheArtifactBucket",
       "Effect": "Allow",
-      "Action": ["s3:PutObject", "s3:GetObject", "s3:ListBucket", "s3:GetBucketLocation"],
+      "Action": [
+        "s3:CreateBucket",
+        "s3:PutObject",
+        "s3:GetObject",
+        "s3:ListBucket",
+        "s3:GetBucketLocation",
+        "s3:PutBucketVersioning",
+        "s3:GetBucketVersioning"
+      ],
       "Resource": [
-        "arn:aws:s3:::REPLACE-WITH-ARTIFACT-BUCKET",
-        "arn:aws:s3:::REPLACE-WITH-ARTIFACT-BUCKET/*"
+        "arn:aws:s3:::s3-feed-freshness-artifacts-057311931122",
+        "arn:aws:s3:::s3-feed-freshness-artifacts-057311931122/*"
       ]
     },
     {
       "Sid": "ListTheMonitoredBucketForTesting",
       "Effect": "Allow",
-      "Action": ["s3:ListBucket", "s3:GetBucketLocation"],
+      "Action": [
+        "s3:ListBucket",
+        "s3:GetBucketLocation"
+      ],
       "Resource": "arn:aws:s3:::cut-dry-vendor-integration"
+    },
+    {
+      "Sid": "DiscoverAlarmTopic",
+      "Effect": "Allow",
+      "Action": [
+        "sns:ListTopics",
+        "sns:GetTopicAttributes"
+      ],
+      "Resource": "*"
     }
   ]
 }

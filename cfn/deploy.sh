@@ -8,7 +8,7 @@
 #
 set -euo pipefail
 
-ARTIFACT_BUCKET="${1:?usage: ./deploy.sh <artifact-bucket> [stack-name] [dry-run]}"
+ARTIFACT_BUCKET="${1:-s3-feed-freshness-artifacts-057311931122}"
 STACK="${2:-s3-feed-freshness}"
 DRY_RUN="${3:-true}"
 REGION="${AWS_REGION:-us-east-2}"

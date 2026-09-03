@@ -189,8 +189,19 @@ RDS and EC2 monitors, it covers this stack too. No new permission request.
 **Deploying by hand** — `deploy-policy.json` in this folder is the minimum
 policy. 13 statements, every one scoped to `s3-feed-freshness*` in us-east-2,
 `PassRole` conditioned to `lambda.amazonaws.com`. Administrator access is not
-required. Replace `REPLACE-WITH-ARTIFACT-BUCKET` with the bucket used for
-`aws cloudformation package` before attaching.
+required.
+
+The policy provisions its own artifact bucket,
+`s3-feed-freshness-artifacts-057311931122`, so there is no dependency on
+discovering an existing one. Create it once after the policy is attached:
+
+```bash
+aws s3 mb s3://s3-feed-freshness-artifacts-057311931122 --region us-east-2
+```
+
+If your team already has a shared CloudFormation artifact bucket, swap both
+ARNs in the `CreateAndUseTheArtifactBucket` statement for that bucket instead
+and drop `s3:CreateBucket`.
 
 ```bash
 aws iam create-policy --policy-name s3-feed-freshness-deploy \
