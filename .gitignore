@@ -1,15 +1,8 @@
-# Terraform state — never commit
-*.tfstate
-*.tfstate.*
-*.tfstate.backup
-.terraform/
-.terraform.tfstate.lock.info
+# Packaged CloudFormation template (contains a resolved S3 code URI)
+cfn/.packaged.yaml
 
-# Generated build artifact
-terraform/build/
-
-# Local runner state
-local/.feed-monitor-state.json
+# Local test watermark
+cfn/.watermark.json
 
 # Python
 __pycache__/

@@ -1,0 +1,248 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  S3 feed freshness monitor. Daily EventBridge-scheduled Lambda that alerts a
+  Slack channel through the platform incoming webhook when a vendor feed prefix
+  has received no new file for N business days. Read-only against S3.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: What to watch }
+        Parameters: [MonitoredBucket, FeedsJson, StaleDays, BusinessDaysOnly, ObjectSuffix]
+      - Label: { default: Alerting }
+        Parameters: [SlackWebhookParam, RenotifyHours, DryRun, AlarmTopicArn]
+      - Label: { default: Operational }
+        Parameters: [ScheduleExpression, DisplayTimezone, LogRetentionDays]
+
+Parameters:
+  MonitoredBucket:
+    Type: String
+    Default: cut-dry-vendor-integration
+    Description: Bucket holding the vendor feeds. Accessed read-only, list operations only.
+
+  FeedsJson:
+    Type: String
+    Default: >-
+      [{"id":"enterprise-cafe/purchase-orders","prefix":"enterprise-cafe/prod/incoming/purchase-orders/"}]
+    Description: >
+      JSON array of feeds. Each entry needs id and prefix; suffix and stale_days
+      are optional per-feed overrides. Add a vendor by editing this parameter -
+      no code change.
+
+  StaleDays:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    Description: Default threshold. A feed alerts at or beyond this many days idle.
+
+  BusinessDaysOnly:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Count Mon-Fri only, so a Friday drop does not alert on Monday.
+
+  ObjectSuffix:
+    Type: String
+    Default: .csv
+    Description: Only objects with this suffix count as a delivery. Empty string disables filtering.
+
+  SlackWebhookParam:
+    Type: String
+    Default: /platform/slack/webhook-dam-alerts
+    Description: >
+      SSM SecureString parameter holding the platform incoming webhook URL.
+      The value is set out of band and never appears in this template.
+
+  RenotifyHours:
+    Type: Number
+    Default: 24
+    MinValue: 0
+    Description: Re-ping Slack this often while a feed stays stale. 0 = one alert per outage.
+
+  DryRun:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Deploy with true. The Lambda logs the exact Slack payload to CloudWatch
+      instead of posting, and does not write the watermark. Flip to false once
+      the output looks right.
+
+  AlarmTopicArn:
+    Type: String
+    Default: ""
+    Description: >
+      Optional existing SNS topic for the monitor-health alarms. Leave empty to
+      skip alarm creation. A monitor that dies silently looks exactly like a
+      healthy feed, so wiring this is strongly recommended.
+
+  ScheduleExpression:
+    Type: String
+    Default: cron(0 15 * * ? *)
+    Description: 15:00 UTC = 08:00 PT.
+
+  DisplayTimezone:
+    Type: String
+    Default: America/Los_Angeles
+    Description: Times in the Slack message render as MM/DD/YY HH:MM in this zone.
+
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 180, 365]
+
+Conditions:
+  HasAlarmTopic: !Not [!Equals [!Ref AlarmTopicArn, ""]]
+
+Resources:
+
+  # ------------------------------------------------------------ watermark
+  # One small SSM String holding {feed_id: {status, last_notified_at}}.
+  # Deliberately NOT an S3 object: writing into the monitored bucket would fire
+  # its ObjectCreated notification into the Snowpipe SNS topic.
+  StateParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/platform-monitors/${AWS::StackName}/watermark"
+      Type: String
+      Value: "{}"
+      Description: !Sub "Feed freshness watermark for ${AWS::StackName}. Managed by the Lambda."
+      Tier: Standard
+
+  # ------------------------------------------------------------------ iam
+  MonitorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: feed-freshness
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+
+              # List only. No s3:GetObject anywhere - the monitor reads listing
+              # metadata and can never see a row of vendor data.
+              - Sid: ListMonitoredBucket
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${MonitoredBucket}"
+
+              - Sid: ReadWriteWatermark
+                Effect: Allow
+                Action: [ssm:GetParameter, ssm:PutParameter]
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/platform-monitors/${AWS::StackName}/watermark"
+
+              - Sid: ReadPlatformWebhook
+                Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SlackWebhookParam}"
+
+              - Sid: DecryptSecureStringViaSsm
+                Effect: Allow
+                Action: kms:Decrypt
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub "ssm.${AWS::Region}.amazonaws.com"
+
+              - Sid: Logs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}:*"
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  # --------------------------------------------------------------- lambda
+  MonitorFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: LogGroup
+    Properties:
+      FunctionName: !Ref AWS::StackName
+      CodeUri: src/
+      Handler: monitor.lambda_handler
+      Runtime: python3.12
+      Timeout: 120
+      MemorySize: 256
+      Role: !GetAtt MonitorRole.Arn
+      Environment:
+        Variables:
+          BUCKET: !Ref MonitoredBucket
+          FEEDS: !Ref FeedsJson
+          STALE_DAYS: !Ref StaleDays
+          SUFFIX: !Ref ObjectSuffix
+          BUSINESS_DAYS_ONLY: !Ref BusinessDaysOnly
+          RENOTIFY_HOURS: !Ref RenotifyHours
+          MONITOR_ID: !Ref AWS::StackName
+          STATE_PARAM: !Ref StateParameter
+          WEBHOOK_PARAM: !Ref SlackWebhookParam
+          DISPLAY_TZ: !Ref DisplayTimezone
+          DRY_RUN: !Ref DryRun
+      Events:
+        Daily:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref ScheduleExpression
+            Description: !Sub "Daily feed freshness check for ${MonitoredBucket}"
+
+  # ------------------------------------------- watchdog on the watchdog
+  ErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasAlarmTopic
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-errors"
+      AlarmDescription: Feed monitor is erroring; staleness alerts may not be firing.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - { Name: FunctionName, Value: !Ref MonitorFunction }
+      Statistic: Sum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopicArn]
+
+  NotRunningAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasAlarmTopic
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-not-running"
+      AlarmDescription: Feed monitor has not run for 2 days; the schedule is broken.
+      Namespace: AWS/Lambda
+      MetricName: Invocations
+      Dimensions:
+        - { Name: FunctionName, Value: !Ref MonitorFunction }
+      Statistic: Sum
+      Period: 86400
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: [!Ref AlarmTopicArn]
+
+Outputs:
+  FunctionName:
+    Value: !Ref MonitorFunction
+  FunctionArn:
+    Value: !GetAtt MonitorFunction.Arn
+  RoleArn:
+    Value: !GetAtt MonitorRole.Arn
+  WatermarkParameter:
+    Description: Delete this parameter's contents to reset alert state.
+    Value: !Ref StateParameter
+  LogGroupName:
+    Value: !Ref LogGroup
+  DryRunMode:
+    Description: Must read false before alerts actually reach Slack.
+    Value: !Ref DryRun
