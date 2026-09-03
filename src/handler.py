@@ -37,23 +37,34 @@ RENOTIFY_HOURS = int(os.environ.get("RENOTIFY_HOURS", "24"))   # 0 = alert once 
 MONITOR_ID = os.environ.get("MONITOR_ID", "enterprise-cafe-po-prod")
 STATE_TABLE = os.environ["STATE_TABLE"]
 
-# Webhook lookup, in priority order. Whichever is set first wins.
-#   SLACK_SECRET_ARN     Secrets Manager (preferred)
-#   SLACK_SSM_PARAM      SSM Parameter Store SecureString
-#   SLACK_WEBHOOK_URL    plain env var (last resort - readable by anyone with
-#                        lambda:GetFunctionConfiguration, and lands in TF state)
+# Slack credential lookup, in priority order. The first one set wins.
+#
+#   Bot token (preferred) - posts via chat.postMessage to SLACK_CHANNEL, so the
+#   target channel is configuration rather than a property of the credential.
+#     SLACK_BOT_TOKEN_SSM   SSM Parameter Store SecureString holding xoxb-...
+#     SLACK_BOT_TOKEN       plain env var (last resort)
+#
+#   Incoming webhook (fallback) - bound at creation to exactly one channel.
+#     SLACK_SECRET_ARN      Secrets Manager
+#     SLACK_SSM_PARAM       SSM Parameter Store SecureString
+#     SLACK_WEBHOOK_URL     plain env var (last resort - readable by anyone with
+#                           lambda:GetFunctionConfiguration, and lands in TF state)
+SLACK_BOT_TOKEN_SSM = os.environ.get("SLACK_BOT_TOKEN_SSM")
+SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
+SLACK_CHANNEL = os.environ.get("SLACK_CHANNEL", "")            # e.g. C04F7EJU5PB
 SLACK_SECRET_ARN = os.environ.get("SLACK_SECRET_ARN")
 SLACK_SSM_PARAM = os.environ.get("SLACK_SSM_PARAM")
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
 METRIC_NAMESPACE = os.environ.get("METRIC_NAMESPACE", "CutAndDry/FeedFreshness")
 DISPLAY_TZ_NAME = os.environ.get("DISPLAY_TZ", "America/Los_Angeles")
 DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
+APP_NAME_HINT = os.environ.get("SLACK_APP_NAME", "S3 Feed Monitor")
 
 s3 = boto3.client("s3")
 ddb = boto3.client("dynamodb")
 cw = boto3.client("cloudwatch")
 
-_webhook_cache = None
+_credential_cache = None    # ("bot", token) | ("webhook", url)
 
 
 # ------------------------------------------------------------------- formatting
@@ -148,55 +159,142 @@ def _put_state(status, last_notified_at, last_file_key, last_file_at):
 
 
 # -------------------------------------------------------------------- slack post
-def _webhook_url():
-    global _webhook_cache
-    if _webhook_cache is not None:
-        return _webhook_cache
+def _ssm_value(name):
+    return boto3.client("ssm").get_parameter(Name=name, WithDecryption=True)[
+        "Parameter"
+    ]["Value"]
 
-    if SLACK_SECRET_ARN:
+
+def _unwrap(raw, *keys):
+    """Accept either a bare string or a JSON blob with one of `keys`."""
+    try:
+        doc = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return raw.strip()
+    if isinstance(doc, dict):
+        for key in keys:
+            if key in doc:
+                return str(doc[key]).strip()
+    return raw.strip()
+
+
+def _credential():
+    """Resolve the Slack credential once per container.
+
+    Returns ("bot", token) or ("webhook", url).
+    """
+    global _credential_cache
+    if _credential_cache is not None:
+        return _credential_cache
+
+    if SLACK_BOT_TOKEN_SSM:
+        token = _unwrap(_ssm_value(SLACK_BOT_TOKEN_SSM), "bot_token", "token")
+        _credential_cache = ("bot", token)
+    elif SLACK_BOT_TOKEN:
+        _credential_cache = ("bot", SLACK_BOT_TOKEN.strip())
+    elif SLACK_SECRET_ARN:
         raw = boto3.client("secretsmanager").get_secret_value(
             SecretId=SLACK_SECRET_ARN
         )["SecretString"]
+        _credential_cache = ("webhook", _unwrap(raw, "webhook_url"))
     elif SLACK_SSM_PARAM:
-        raw = boto3.client("ssm").get_parameter(
-            Name=SLACK_SSM_PARAM, WithDecryption=True
-        )["Parameter"]["Value"]
+        _credential_cache = ("webhook", _unwrap(_ssm_value(SLACK_SSM_PARAM), "webhook_url"))
     elif SLACK_WEBHOOK_URL:
-        raw = SLACK_WEBHOOK_URL
+        _credential_cache = ("webhook", SLACK_WEBHOOK_URL.strip())
     else:
         raise RuntimeError(
-            "No webhook source configured. Set one of SLACK_SECRET_ARN, "
-            "SLACK_SSM_PARAM, or SLACK_WEBHOOK_URL."
+            "No Slack credential configured. Set SLACK_BOT_TOKEN_SSM (preferred) "
+            "or one of SLACK_BOT_TOKEN, SLACK_SECRET_ARN, SLACK_SSM_PARAM, "
+            "SLACK_WEBHOOK_URL."
         )
 
-    try:
-        _webhook_cache = json.loads(raw)["webhook_url"]
-    except (json.JSONDecodeError, KeyError, TypeError):
-        _webhook_cache = raw.strip()
-
-    if not _webhook_cache.startswith("https://hooks.slack.com/"):
+    kind, value = _credential_cache
+    if kind == "bot":
+        if not value.startswith(("xoxb-", "xoxp-")):
+            _credential_cache = None
+            raise RuntimeError(
+                "Resolved Slack bot token does not start with xoxb-. Check that the "
+                "SSM parameter holds the Bot User OAuth Token, not the signing secret."
+            )
+        if not SLACK_CHANNEL:
+            _credential_cache = None
+            raise RuntimeError("SLACK_CHANNEL must be set when using a bot token.")
+    elif not value.startswith("https://hooks.slack.com/"):
+        _credential_cache = None
         raise RuntimeError("Resolved webhook does not look like a Slack webhook URL")
-    return _webhook_cache
+
+    return _credential_cache
 
 
-def _post_slack(blocks, fallback):
-    payload = json.dumps({"text": fallback, "blocks": blocks}).encode()
-    if DRY_RUN:
-        LOG.info("DRY_RUN, would post to Slack: %s", payload.decode())
-        return
+def _http_post(url, payload, headers):
     req = urllib.request.Request(
-        _webhook_url(),
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
+        url, data=payload, headers=headers, method="POST"
     )
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
-            body = resp.read().decode()
-        if body.strip() != "ok":
-            raise RuntimeError(f"Unexpected Slack response: {body}")
+            return resp.status, resp.read().decode()
     except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"Slack returned {exc.code}: {exc.read().decode()}") from exc
+        return exc.code, exc.read().decode()
+
+
+def _post_slack(blocks, fallback):
+    """Post one message. Raises on failure so the Lambda errors and alarms fire."""
+    # Resolve the credential lazily: a DRY_RUN must be able to render the exact
+    # payload with no Slack secret and no ssm:GetParameter permission at all.
+    if DRY_RUN:
+        kind, credential = ("bot" if (SLACK_BOT_TOKEN_SSM or SLACK_BOT_TOKEN or SLACK_CHANNEL)
+                            else "webhook"), "DRY_RUN"
+    else:
+        kind, credential = _credential()
+
+    if kind == "bot":
+        body = {
+            "channel": SLACK_CHANNEL,
+            "text": fallback,          # notification + accessibility fallback
+            "blocks": blocks,
+            "unfurl_links": False,
+            "unfurl_media": False,
+        }
+        url = "https://slack.com/api/chat.postMessage"
+        headers = {
+            "Content-Type": "application/json; charset=utf-8",
+            "Authorization": f"Bearer {credential}",
+        }
+    else:
+        body = {"text": fallback, "blocks": blocks}
+        url = credential
+        headers = {"Content-Type": "application/json"}
+
+    payload = json.dumps(body).encode()
+
+    if DRY_RUN:
+        LOG.info("DRY_RUN, would post to Slack via %s: %s", kind, payload.decode())
+        return
+
+    status, text = _http_post(url, payload, headers)
+
+    if kind == "bot":
+        try:
+            doc = json.loads(text)
+        except json.JSONDecodeError:
+            raise RuntimeError(f"Slack returned HTTP {status}: {text[:400]}")
+        if not doc.get("ok"):
+            err = doc.get("error", "unknown_error")
+            hint = {
+                "not_in_channel": (
+                    f" - invite the app to the channel: /invite @{APP_NAME_HINT}"
+                ),
+                "channel_not_found": " - check SLACK_CHANNEL is the channel ID, not the name",
+                "invalid_auth": " - the bot token is wrong, revoked, or from another workspace",
+                "missing_scope": f" - the app needs the chat:write scope (needed: {doc.get('needed')})",
+                "ratelimited": " - backed off by Slack; the next scheduled run will retry",
+            }.get(err, "")
+            raise RuntimeError(f"Slack chat.postMessage failed: {err}{hint}")
+        LOG.info("Posted to Slack channel %s at ts %s", SLACK_CHANNEL, doc.get("ts"))
+        return
+
+    if status != 200 or text.strip() != "ok":
+        raise RuntimeError(f"Slack webhook returned {status}: {text[:400]}")
 
 
 def _stale_blocks(last_key, last_ts, elapsed, object_count):
