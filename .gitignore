@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+packaged*.yaml
+*.zip
+.DS_Store
+.idea/
+.vscode/
