@@ -241,8 +241,10 @@ python3 test_feed.py status      # what the monitor will see on its next run
 
 **Why an empty prefix rather than old files.** S3 will not let you backdate
 `LastModified`, so ageing a file into staleness is not possible. An empty prefix
-is: the monitor reports it as "no files ever", which is stale by definition.
-Dropping one file clears it. Both transitions, no waiting.
+is: the monitor reports it as "no files ever", which is past any threshold and so
+stale by definition. Dropping one file puts the feed at 0 days idle and clears
+it. Both transitions, no waiting — and because neither depends on the threshold,
+non-prod runs prod's real `StaleDays=3` rather than a lowered one.
 
 `RENOTIFY_HOURS=0` in non-prod means one alert per outage rather than a repeat
 every thirty minutes, so #slack-test stays readable.

@@ -128,11 +128,7 @@ def cmd_status(env, s3):
     newest = max(objs, key=lambda o: o["LastModified"])
     print(f"    {len(objs):,} object(s); newest {newest['Key'].rsplit('/', 1)[-1]}")
     print(f"    last modified {newest['LastModified'].astimezone().strftime('%m/%d/%y %H:%M %Z')}")
-    if env.get("STALE_DAYS") == "1":
-        print("    ->  at StaleDays=1 a file uploaded today still counts as one")
-        print("        business day idle, so the feed reads STALE until tomorrow")
-    else:
-        print(f"    ->  feed is OK at StaleDays={env.get('STALE_DAYS', '3')}")
+    print(f"    ->  0 days idle, feed is OK at StaleDays={env.get('STALE_DAYS', '3')}")
 
 
 def cmd_clear(env, s3):

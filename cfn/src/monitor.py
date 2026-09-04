@@ -192,8 +192,10 @@ def _check_webhook():
 
 
 # ------------------------------------------------------------- message text
-def _unit():
-    return "business days" if BUSINESS_DAYS_ONLY else "days"
+def _unit(n=None):
+    """Plural by default; singular only when n is exactly 1."""
+    base = "business day" if BUSINESS_DAYS_ONLY else "day"
+    return base if n == 1 else base + "s"
 
 
 def _stale_text(stale, total_feeds, overall_ts):
@@ -202,12 +204,15 @@ def _stale_text(stale, total_feeds, overall_ts):
         "",
     ]
     for f in stale:
-        idle = "no files ever" if f["elapsed"] == float("inf") else f"{f['elapsed']:,.1f} {_unit()}"
+        threshold = f"threshold {f['threshold']:,} {_unit(f['threshold'])}"
         lines.append(f"*{f['id']}*  `{f['prefix']}`")
-        lines.append(
-            f"    last file {_fmt(f['last_ts'])}  -  idle {idle}  "
-            f"(threshold {f['threshold']:,} {_unit()})"
-        )
+        if f["elapsed"] == float("inf"):
+            lines.append(f"    no file has ever landed here  ({threshold})")
+        else:
+            lines.append(
+                f"    last file {_fmt(f['last_ts'])}  -  "
+                f"idle {f['elapsed']:,.1f} {_unit()}  ({threshold})"
+            )
         if f["last_key"]:
             lines.append(f"    newest object: `{f['last_key'].rsplit('/', 1)[-1]}`")
         lines.append(f"    {f['count']:,} files in prefix")
