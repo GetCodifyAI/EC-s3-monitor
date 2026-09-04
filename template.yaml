@@ -1,0 +1,213 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  S3 staleness monitor. Lists a prefix on a schedule and posts a Slack alert
+  when no new file has landed for N consecutive days. Read-only against the
+  monitored bucket; creates nothing inside it.
+
+Parameters:
+  MonitoredBucket:
+    Type: String
+    Description: Bucket to watch. The monitor is never granted s3:GetObject on it.
+    Default: cut-and-dry-test
+
+  FeedsJson:
+    Type: String
+    Description: >
+      JSON array of {id, prefix} with optional per-entry "suffix" and
+      "stale_days". Adding a prefix is a parameter change, not a code change.
+    Default: '[{"id":"test-dev","prefix":"test-dev/"}]'
+
+  StaleDays:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    Description: Alert when the newest object is this many days old or older.
+
+  BusinessDaysOnly:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "false"
+    Description: >
+      Count Mon-Fri only. Left false so "three consecutive days" means three
+      calendar days. Set true if a Friday delivery should not read as stale on
+      Monday.
+
+  ObjectSuffix:
+    Type: String
+    Default: ""
+    Description: >
+      Only count objects whose key ends with this, lowercased (e.g. ".csv").
+      Empty counts every non-empty object.
+
+  SlackWebhookParam:
+    Type: String
+    Default: /platform-monitors/s3-staleness/slack-test-webhook
+    Description: SSM SecureString parameter holding the #slack-test incoming webhook URL.
+
+  DryRun:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+    Description: >
+      true logs the exact message instead of posting it, and still resolves the
+      webhook parameter so a clean dry run proves delivery would have worked.
+
+  ScheduleExpression:
+    Type: String
+    Default: cron(0 15 * * ? *)
+    Description: EventBridge schedule, UTC. Default is 08:00 PT daily.
+
+  DisplayTimeZone:
+    Type: String
+    Default: America/Los_Angeles
+    Description: Timezone for timestamps in the Slack message.
+
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365]
+
+  AlarmTopicArn:
+    Type: String
+    Default: ""
+    Description: >
+      Existing SNS topic for the monitor's own health alarm. Empty creates no
+      alarm - the monitor then has nothing watching it.
+
+Conditions:
+  HasAlarmTopic: !Not [!Equals [!Ref AlarmTopicArn, ""]]
+
+Resources:
+  MonitorLogGroup:
+    Type: AWS::Logs::LogGroup
+    # Owned by the stack rather than created implicitly by Lambda, so retention
+    # is set from the first invocation and the group is removed on stack delete.
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  MonitorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: monitor
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # ListBucket only. No GetObject anywhere in this policy: the
+              # monitor reads object metadata and cannot read object contents.
+              - Sid: ListMonitoredPrefix
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${MonitoredBucket}"
+
+              - Sid: ReadWebhookSecret
+                Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SlackWebhookParam}"
+
+              # SecureString decryption under the AWS-managed SSM key. Scoped by
+              # ViaService so this role cannot decrypt anything except through SSM.
+              - Sid: DecryptWebhookSecret
+                Effect: Allow
+                Action: kms:Decrypt
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub "ssm.${AWS::Region}.amazonaws.com"
+
+              - Sid: Logs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${MonitorLogGroup.Arn}:*"
+      Tags:
+        - {Key: Owner, Value: eniyavan}
+        - {Key: Project, Value: s3-staleness-monitor}
+
+  MonitorFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: MonitorLogGroup
+    Properties:
+      FunctionName: !Ref AWS::StackName
+      Description: !Sub "Alerts #slack-test when ${MonitoredBucket} goes quiet"
+      Runtime: python3.12
+      Handler: monitor.lambda_handler
+      Role: !GetAtt MonitorRole.Arn
+      # Listing is a handful of API calls; the default 128 MB is plenty. The
+      # timeout is generous only so a slow SSM or Slack call cannot truncate a run.
+      MemorySize: 128
+      Timeout: 60
+      Code: src/
+      Environment:
+        Variables:
+          BUCKET: !Ref MonitoredBucket
+          FEEDS: !Ref FeedsJson
+          STALE_DAYS: !Ref StaleDays
+          BUSINESS_DAYS_ONLY: !Ref BusinessDaysOnly
+          SUFFIX: !Ref ObjectSuffix
+          WEBHOOK_PARAM: !Ref SlackWebhookParam
+          DISPLAY_TZ: !Ref DisplayTimeZone
+          DRY_RUN: !Ref DryRun
+          MONITOR_ID: !Ref AWS::StackName
+      Tags:
+        - {Key: Owner, Value: eniyavan}
+        - {Key: Project, Value: s3-staleness-monitor}
+
+  Schedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${AWS::StackName}-schedule"
+      Description: !Sub "Daily staleness check for ${MonitoredBucket}"
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Id: monitor
+          Arn: !GetAtt MonitorFunction.Arn
+
+  SchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt MonitorFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt Schedule.Arn
+
+  # The monitor watching the monitor. A silent run is the healthy state, which
+  # means a monitor that has crashed and a feed that is fine look identical from
+  # Slack. This alarm is the only thing that tells them apart.
+  ErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasAlarmTopic
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-errors"
+      AlarmDescription: The staleness monitor itself is failing.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{Name: FunctionName, Value: !Ref MonitorFunction}]
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopicArn]
+
+Outputs:
+  FunctionName:
+    Description: Invoke this by name to run the check on demand.
+    Value: !Ref MonitorFunction
+  LogGroup:
+    Value: !Ref MonitorLogGroup
+  RoleArn:
+    Value: !GetAtt MonitorRole.Arn
+  Watching:
+    Value: !Sub "s3://${MonitoredBucket}/ - ${FeedsJson}"
+  Mode:
+    Description: DryRun true means nothing reaches Slack.
+    Value: !Ref DryRun
