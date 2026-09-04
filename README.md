@@ -29,6 +29,8 @@ intended to live in `aws-infra`.
 | `cfn/RUNBOOK.md` | **Start here.** Deployment, triage in both directions, common operations |
 | `cfn/deploy.sh` | Package and deploy, dry-run by default |
 | `cfn/run_local.py` | Offline harness — runs the real handler with no AWS credentials |
+| `cfn/env/*.env` | One file per environment: account, stack, bucket, feeds, thresholds |
+| `cfn/test_feed.py` | Non-prod only. Creates the scratch bucket and drives STALE ↔ recovery |
 
 `cfn/` is deliberately self-contained so it can be copied into `aws-infra` as a
 single folder.
@@ -39,14 +41,36 @@ single folder.
 # prove the logic with zero AWS access
 python3 cfn/run_local.py --offline --scenario mixed --reset
 
-# deploy in dry-run: logs the Slack payload, posts nothing
-cd cfn && ./deploy.sh <cfn-artifact-bucket>
+# prove it end to end in non-prod, alerting to #slack-test
+aws sso login --profile non-prod-sso
+cd cfn
+python3 test_feed.py create
+./deploy.sh nonprod          # dry-run
+./deploy.sh nonprod false    # live
 
-# once the logged output looks right
-./deploy.sh <cfn-artifact-bucket> s3-feed-freshness false
+# prod, once the deploy policy is attached
+./deploy.sh prod             # dry-run
+./deploy.sh prod false       # live
 ```
 
+`deploy.sh` reads the target account out of `env/<name>.env` and refuses to run
+when your credentials point somewhere else, so non-prod parameters can never
+land on the prod stack.
+
 Full detail in [`cfn/RUNBOOK.md`](cfn/RUNBOOK.md).
+
+## Environments
+
+| Environment | Account | Watches | Alerts to |
+|---|---|---|---|
+| `nonprod` | 147723036280 | a scratch bucket this repo creates | #slack-test |
+| `prod` | 057311931122 | `cut-dry-vendor-integration` | #dam-alerts |
+
+The vendor bucket lives in prod and is not readable from the Eng account, so
+non-prod watches a scratch prefix instead. Everything else is real there —
+schedule, IAM role, watermark, message text and an actual Slack post. Staleness
+is driven by emptying the prefix rather than ageing files, because S3 will not
+let you backdate `LastModified`.
 
 ## Configuration
 

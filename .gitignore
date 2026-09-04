@@ -1,5 +1,6 @@
 # Packaged CloudFormation template (contains a resolved S3 code URI)
 cfn/.packaged.yaml
+cfn/.packaged.*.yaml
 
 # Local test watermark
 cfn/.watermark.json

@@ -1,8 +1,14 @@
 # Runbook — S3 feed freshness monitor
 
-**Stack** `s3-feed-freshness` · **Region** us-east-2 · **Account** 057311931122
-**Alerts to** #dam-alerts via the platform incoming webhook
-**Owner** data-eng
+**Region** us-east-2 · **Owner** data-eng
+
+| Environment | Account | Stack | Watches | Alerts to |
+|---|---|---|---|---|
+| `prod` | 057311931122 | `s3-feed-freshness` | `cut-dry-vendor-integration` | #dam-alerts |
+| `nonprod` | 147723036280 | `s3-feed-freshness-nonprod` | a scratch bucket this repo creates | #slack-test |
+
+Each environment is a file in `env/`, and `deploy.sh` reads the account out of it
+and refuses to run when your credentials point somewhere else.
 
 Alerts when a vendor feed prefix in `cut-dry-vendor-integration` has received no
 new `.csv` for its threshold (default 3 business days). Silent on a clean run.
@@ -66,7 +72,7 @@ If the platform webhook lives under a different path, pass
 
 ```bash
 cd cfn
-./deploy.sh <cfn-artifact-bucket>
+./deploy.sh prod
 ```
 
 `DryRun` defaults to `true`: the Lambda logs the exact message it would post and
@@ -102,7 +108,7 @@ stale, and it logs only the host, never the URL.
 ### 4. Go live
 
 ```bash
-./deploy.sh <cfn-artifact-bucket> s3-feed-freshness false
+./deploy.sh prod false
 ```
 
 The PO prefix is currently well past its threshold, so the next invoke posts a
@@ -112,12 +118,147 @@ real alert immediately — free end-to-end validation.
 
 A monitor that dies silently is indistinguishable from a healthy feed.
 
+Set `ALARM_TOPIC_ARN` in `env/prod.env` and redeploy:
+
 ```bash
-ALARM_TOPIC_ARN=arn:aws:sns:us-east-2:057311931122:platform-alerts \
-  ./deploy.sh <cfn-artifact-bucket> s3-feed-freshness false
+./deploy.sh prod false
 ```
 
 ---
+
+---
+
+## Non-prod: proving it end to end
+
+Account 147723036280 (Cut+Dry Eng), us-east-2, alerting to **#slack-test**. This
+is where you prove the monitor works before asking anyone to approve a prod
+deploy — everything except the prod feed itself is real here: the schedule, the
+IAM role, the SSM watermark, the business-day maths, the message text, and an
+actual Slack post.
+
+### Why non-prod cannot watch the real feed
+
+`cut-dry-vendor-integration` lives in the **prod** account. A Lambda in non-prod
+cannot list it without a bucket policy change on the prod side, which is exactly
+the access nobody has yet. So non-prod watches a scratch bucket this repo
+creates, `s3-feed-freshness-testfeed-147723036280`, and the prod feed stays
+untouched.
+
+That costs nothing in fidelity for the thing being tested. The monitor's only
+input from S3 is "what is the newest object under this prefix, and when did it
+land" — a scratch prefix answers that exactly the way the real one does.
+
+### Sign in
+
+Needs **AWS CLI v2.9 or later** — the `[sso-session]` block below is not
+understood by v1 or by early v2 builds, and the failure looks like a confusing
+profile error rather than a version complaint.
+
+```bash
+aws --version        # expect aws-cli/2.x, 2.9 or newer
+```
+
+Append to `~/.aws/config`:
+
+```ini
+[sso-session non-prod-sso]
+sso_start_url = https://identitycenter.amazonaws.com/ssoins-668463dde3ff5e4e
+sso_region = us-east-2
+sso_registration_scopes = sso:account:access
+
+[profile non-prod-sso]
+sso_session = non-prod-sso
+sso_account_id = 147723036280
+sso_role_name = NonProdDeveloper
+region = us-east-2
+output = json
+```
+
+`https://d-9a67580b1d.awsapps.com/start` is an alias for the same Identity Center
+instance and works identically as `sso_start_url`.
+
+```bash
+aws sso login --profile non-prod-sso
+export AWS_PROFILE=non-prod-sso
+aws sts get-caller-identity          # expect 147723036280
+```
+
+A browser opens for Google sign-in. `AWS_PROFILE` lasts for that shell only —
+put it in your shell profile, or pass `--profile non-prod-sso` on every command.
+
+Sessions last 8 hours. `deploy.sh` and `test_feed.py` both check the account
+before doing anything, so a stale or wrong-account session fails loudly rather
+than deploying somewhere unexpected.
+
+> **One IAM caveat.** The stack creates its own execution role. `NonProdDeveloper`
+> is described as full create/write/delete, but IAM changes are listed against
+> `NonProdAdmin` — so `iam:CreateRole` may be refused under the developer role. If
+> the deploy fails on the role, re-run it with `sso_role_name = NonProdAdmin`
+> (1-hour session). This is the one step that may need the elevated set.
+
+### Put the #slack-test webhook in SSM
+
+Add an incoming webhook for **#slack-test** to the existing "S3 Feed Monitor"
+Slack app, then store it in this account:
+
+```bash
+aws ssm put-parameter \
+  --name /platform-monitors/s3-feed-freshness/slack-test-webhook \
+  --value 'https://hooks.slack.com/services/...' \
+  --type SecureString --region us-east-2
+```
+
+The path is `SLACK_WEBHOOK_PARAM` in `env/nonprod.env`. Nothing else reads it,
+and the value never enters the template or the repo.
+
+### The run
+
+```bash
+cd cfn
+
+python3 test_feed.py create      # scratch bucket, public access blocked, tagged
+./deploy.sh nonprod              # dry-run: logs the payload, posts nothing
+
+aws lambda invoke --function-name s3-feed-freshness-nonprod \
+  --region us-east-2 /dev/stdout | jq '.webhook_check, .feeds_stale'
+```
+
+`webhook_check.ok` must read `true` before going further — that is the whole
+point of the dry run. Then:
+
+```bash
+./deploy.sh nonprod false        # live
+```
+
+`env/nonprod.env` sets `rate(30 minutes)`, so you never wait more than half an
+hour for a result. Drive the two transitions by hand:
+
+```bash
+python3 test_feed.py clear       # empty prefix  -> next run posts a STALE alert
+python3 test_feed.py drop        # one file      -> next run posts the recovery
+python3 test_feed.py status      # what the monitor will see on its next run
+```
+
+**Why an empty prefix rather than old files.** S3 will not let you backdate
+`LastModified`, so ageing a file into staleness is not possible. An empty prefix
+is: the monitor reports it as "no files ever", which is stale by definition.
+Dropping one file clears it. Both transitions, no waiting.
+
+`RENOTIFY_HOURS=0` in non-prod means one alert per outage rather than a repeat
+every thirty minutes, so #slack-test stays readable.
+
+### Clean up when you are done
+
+Non-prod is not free, though this stack is close to it — a Lambda on a 30-minute
+schedule and a nearly-empty bucket. Still:
+
+```bash
+aws cloudformation delete-stack --stack-name s3-feed-freshness-nonprod --region us-east-2
+aws s3 rb s3://s3-feed-freshness-testfeed-147723036280 --force --region us-east-2
+```
+
+Or leave the stack and disable the EventBridge rule if you want to come back to it.
+
 
 ## Common operations
 
