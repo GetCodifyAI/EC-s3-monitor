@@ -27,8 +27,18 @@ cd "$(dirname "$0")"
 ENV_FILE="env/${ENV_NAME}.env"
 [[ -f "$ENV_FILE" ]] || { echo "error: no such environment file: $ENV_FILE" >&2; exit 2; }
 
+# An explicit PROFILE in the environment wins over the one in the env file, so
+# the first deploy can be run under a break-glass role without editing config
+# that is committed:  PROFILE=non-prod-admin ./deploy.sh nonprod
+PROFILE_OVERRIDE="${PROFILE:-}"
+
 # shellcheck disable=SC1090
 set -a; source "$ENV_FILE"; set +a
+
+if [[ -n "$PROFILE_OVERRIDE" && "$PROFILE_OVERRIDE" != "${PROFILE:-}" ]]; then
+  echo "==> Profile overridden from the environment: $PROFILE_OVERRIDE (env file says ${PROFILE:-none})"
+  PROFILE="$PROFILE_OVERRIDE"
+fi
 
 AWS=(aws --region "$REGION")
 [[ -n "${PROFILE:-}" ]] && AWS+=(--profile "$PROFILE")
