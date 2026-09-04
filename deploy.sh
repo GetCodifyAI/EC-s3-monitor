@@ -51,11 +51,21 @@ AWS=(aws --region "$REGION")
 # you an error message rather than a deployment.
 # ---------------------------------------------------------------------------
 echo "==> Checking credentials"
-CALLER_JSON=$("${AWS[@]}" sts get-caller-identity --output json 2>/dev/null) || {
-  echo "error: no valid AWS credentials." >&2
-  echo "       run: aws sso login --profile ${PROFILE:-<your-profile>}" >&2
+CALLER_ERR=$(mktemp)
+trap 'rm -f "$CALLER_ERR"' EXIT
+if ! CALLER_JSON=$("${AWS[@]}" sts get-caller-identity --output json 2>"$CALLER_ERR"); then
+  echo "error: could not read caller identity for profile '${PROFILE:-<none>}'." >&2
+  echo >&2
+  # Show what AWS actually said. Swallowing this turns "you do not have that
+  # permission set" and "your session expired" into the same useless message.
+  sed 's/^/       /' "$CALLER_ERR" >&2
+  echo >&2
+  echo "       If the session has expired:  aws sso login --profile ${PROFILE:-<your-profile>}" >&2
+  echo "       If sso login succeeded but this still fails, that permission set is" >&2
+  echo "       probably not assigned to you for this account - check the AWS access" >&2
+  echo "       portal, or ask #platform." >&2
   exit 1
-}
+fi
 CALLER_ACCOUNT=$(echo "$CALLER_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["Account"])')
 CALLER_ARN=$(echo "$CALLER_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["Arn"])')
 
@@ -110,7 +120,7 @@ echo "==> Packaging"
 # leaves a src/__pycache__ behind, and cloudformation package would ship it.
 rm -rf src/__pycache__
 PACKAGED=$(mktemp -t packaged.XXXXXX.yaml)
-trap 'rm -f "$PACKAGED"' EXIT
+trap 'rm -f "$PACKAGED" "$CALLER_ERR"' EXIT
 "${AWS[@]}" cloudformation package \
   --template-file template.yaml \
   --s3-bucket "$ARTIFACT_BUCKET" \
