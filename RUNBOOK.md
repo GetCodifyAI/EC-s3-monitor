@@ -253,20 +253,32 @@ three days, and **do not put probe files into the prefix** — the bucket has
 
 Temporarily lower the threshold instead, so the current contents read as stale:
 
-Whatever `elapsed_days` showed in step 6, set the threshold below it:
+Lowering `StaleDays` only works when the newest file is already older than the
+floor of 1 day. When the prefix has a file from today it cannot fire, so make
+the monitor look at something that genuinely has nothing in it instead. Setting
+a suffix that matches no object is the cleanest way - it touches no data, and
+the prefix, the bucket and the schedule all stay exactly as they are:
 
 ```bash
-sed -i.bak 's/^STALE_DAYS=3/STALE_DAYS=1/' env/nonprod.env
+sed -i.bak 's/^OBJECT_SUFFIX=$/OBJECT_SUFFIX=.no-such-suffix/' env/nonprod.env
 ./deploy.sh nonprod false
 aws lambda invoke --function-name s3-staleness-monitor /dev/stdout | python3 -m json.tool
 ```
 
-The message should land in #slack-test within a second or two. Then put it back:
+Zero objects match, which reads as "no file has ever landed here" - past any
+threshold - so it alerts. That exercises the entire delivery path: schedule,
+IAM role, SSM lookup, webhook, and the message itself.
+
+Put it back and confirm the next run is silent again:
 
 ```bash
 mv env/nonprod.env.bak env/nonprod.env
 ./deploy.sh nonprod false
+aws lambda invoke --function-name s3-staleness-monitor /dev/stdout | python3 -m json.tool
 ```
+
+The `feeds[0].objects` count should return to its real value and `status` to
+`OK`. If it does not, the suffix did not get reset - check `env/nonprod.env`.
 
 Check the message renders properly in Slack — the bold prefix name, the
 backticked path, the timestamp in the right timezone. Then put the threshold
