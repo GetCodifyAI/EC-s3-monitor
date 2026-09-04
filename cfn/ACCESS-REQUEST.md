@@ -13,6 +13,12 @@ this closes.
 The code is written, reviewed and merged. It cannot be deployed because my IAM
 user has no CloudFormation access.
 
+> **If an admin is deploying this directly**, none of the IAM grant below is
+> needed — they already hold the permissions. Skip to
+> [What I still need regardless](#what-i-still-need-regardless), which is the
+> only part that still applies, and follow *First deployment* in `RUNBOOK.md`.
+> The policy is documented here for the case where the deploy is delegated back.
+
 ## What I'm asking for
 
 Attach one customer-managed policy to IAM user `eniyavant`:

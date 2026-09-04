@@ -48,6 +48,15 @@ It reports both the per-feed timestamp and the newest file across all feeds.
 
 ## First deployment
 
+Run by whoever holds credentials in 057311931122 — `deploy.sh` reads the target
+account out of `env/prod.env` and refuses to run against any other.
+
+**What has been exercised, and what has not.** The handler's logic is covered by
+the offline harness, and the message text has been reviewed. As of the last
+commit nothing in this stack has run in AWS: no deploy, no invocation, no
+webhook resolved. That is what `DryRun=true` is for, and it is why step 3 is not
+optional — it is the first moment any of this touches a real service.
+
 ### 1. Confirm the webhook parameter exists
 
 The Lambda reads the platform webhook from an SSM SecureString.
@@ -65,8 +74,9 @@ read the deploy policy grants against this path — deliberately, so deploying
 the monitor never requires a human to read the webhook secret. Proving the value
 is *readable and well-formed* is the dry run's job (step 3).
 
-If the platform webhook lives under a different path, pass
-`SLACK_WEBHOOK_PARAM=/your/path` to `deploy.sh`.
+If the platform webhook lives under a different path, set
+`SLACK_WEBHOOK_PARAM` in `env/prod.env` before deploying. It is the one value in
+that file nobody has confirmed.
 
 ### 2. Deploy in dry-run
 
@@ -123,8 +133,6 @@ Set `ALARM_TOPIC_ARN` in `env/prod.env` and redeploy:
 ```bash
 ./deploy.sh prod false
 ```
-
----
 
 ---
 
