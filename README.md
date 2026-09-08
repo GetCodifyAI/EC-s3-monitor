@@ -21,10 +21,11 @@ CloudFormation stack, dry-run first.
 | Path | What |
 |---|---|
 | `RUNBOOK.md` | **Start here.** Setup, deploy, triage, teardown |
+| `PROD-HANDOVER.md` | For whoever deploys this in prod — prerequisites, safety notes, sequence |
 | `src/monitor.py` | The handler |
 | `template.yaml` | CloudFormation: role, Lambda, log group, schedule, optional alarm |
 | `deploy.sh` | Package and deploy. Dry-run by default, guards the target account |
-| `env/nonprod.env` | Account, bucket, prefixes, threshold, schedule |
+| `env/*.env` | One file per environment: account, bucket, prefixes, threshold, schedule |
 | `run_local.py` | Offline harness — runs the real handler with no AWS credentials |
 | `test_monitor.py` | 30 unit tests, no AWS and no network |
 | `stubs.py` | Fake boto3 shared by the harness and the tests |
@@ -46,9 +47,27 @@ aws sso login --profile non-prod-sso
 
 Full detail, including creating the Slack webhook, in [`RUNBOOK.md`](RUNBOOK.md).
 
+## Environments
+
+| Environment | Account | Watches | Rule | Alerts to |
+|---|---|---|---|---|
+| `nonprod` | 147723036280 | `cut-and-dry-test/test-dev/` | 3 calendar days, any file | #slack-test |
+| `prod` | 057311931122 | `cut-dry-vendor-integration/enterprise-cafe/prod/incoming/purchase-orders/` | 3 business days, `.csv` only | #dam-alerts |
+
+`nonprod` is live. `prod` is configured but not yet deployed — see
+[`PROD-HANDOVER.md`](PROD-HANDOVER.md).
+
+`deploy.sh` reads the target account out of `env/<name>.env` and refuses to run
+when your credentials point somewhere else, so non-prod parameters can never
+land on the prod stack.
+
+Prod counts business days because the vendor feed follows a business calendar —
+a Friday delivery must not read as stale on Monday morning. Non-prod counts
+calendar days, matching how the requirement was originally phrased.
+
 ## Configuration
 
-Everything is a CloudFormation parameter, set from `env/nonprod.env`. Watching a
+Everything is a CloudFormation parameter, set from `env/<name>.env`. Watching a
 second prefix, changing the threshold or moving the channel is a config change
 and a redeploy — never a code change.
 
