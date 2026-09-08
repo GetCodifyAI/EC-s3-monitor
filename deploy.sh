@@ -27,8 +27,18 @@ cd "$(dirname "$0")"
 ENV_FILE="env/${ENV_NAME}.env"
 [[ -f "$ENV_FILE" ]] || { echo "error: no such environment file: $ENV_FILE" >&2; exit 2; }
 
+# An explicit PROFILE in the environment wins over the one in the env file, so
+# the first deploy can be run under a break-glass role without editing config
+# that is committed:  PROFILE=non-prod-admin ./deploy.sh nonprod
+PROFILE_OVERRIDE="${PROFILE:-}"
+
 # shellcheck disable=SC1090
 set -a; source "$ENV_FILE"; set +a
+
+if [[ -n "$PROFILE_OVERRIDE" && "$PROFILE_OVERRIDE" != "${PROFILE:-}" ]]; then
+  echo "==> Profile overridden from the environment: $PROFILE_OVERRIDE (env file says ${PROFILE:-none})"
+  PROFILE="$PROFILE_OVERRIDE"
+fi
 
 AWS=(aws --region "$REGION")
 [[ -n "${PROFILE:-}" ]] && AWS+=(--profile "$PROFILE")
@@ -41,11 +51,21 @@ AWS=(aws --region "$REGION")
 # you an error message rather than a deployment.
 # ---------------------------------------------------------------------------
 echo "==> Checking credentials"
-CALLER_JSON=$("${AWS[@]}" sts get-caller-identity --output json 2>/dev/null) || {
-  echo "error: no valid AWS credentials." >&2
-  echo "       run: aws sso login --profile ${PROFILE:-<your-profile>}" >&2
+CALLER_ERR=$(mktemp)
+trap 'rm -f "$CALLER_ERR"' EXIT
+if ! CALLER_JSON=$("${AWS[@]}" sts get-caller-identity --output json 2>"$CALLER_ERR"); then
+  echo "error: could not read caller identity for profile '${PROFILE:-<none>}'." >&2
+  echo >&2
+  # Show what AWS actually said. Swallowing this turns "you do not have that
+  # permission set" and "your session expired" into the same useless message.
+  sed 's/^/       /' "$CALLER_ERR" >&2
+  echo >&2
+  echo "       If the session has expired:  aws sso login --profile ${PROFILE:-<your-profile>}" >&2
+  echo "       If sso login succeeded but this still fails, that permission set is" >&2
+  echo "       probably not assigned to you for this account - check the AWS access" >&2
+  echo "       portal, or ask #platform." >&2
   exit 1
-}
+fi
 CALLER_ACCOUNT=$(echo "$CALLER_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["Account"])')
 CALLER_ARN=$(echo "$CALLER_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["Arn"])')
 
@@ -100,7 +120,7 @@ echo "==> Packaging"
 # leaves a src/__pycache__ behind, and cloudformation package would ship it.
 rm -rf src/__pycache__
 PACKAGED=$(mktemp -t packaged.XXXXXX.yaml)
-trap 'rm -f "$PACKAGED"' EXIT
+trap 'rm -f "$PACKAGED" "$CALLER_ERR"' EXIT
 "${AWS[@]}" cloudformation package \
   --template-file template.yaml \
   --s3-bucket "$ARTIFACT_BUCKET" \
@@ -138,17 +158,16 @@ if [[ "$DRY_RUN" == "true" ]]; then
 Deployed in DRY RUN. Nothing will reach Slack.
 Run it now and read what it would have posted:
 
-  aws lambda invoke --function-name $STACK --region $REGION \\
-    ${PROFILE:+--profile $PROFILE }/dev/stdout | python3 -m json.tool
+  aws lambda invoke --function-name $STACK --region $REGION ${PROFILE:+--profile $PROFILE }/tmp/monitor-out.json > /dev/null && python3 -m json.tool /tmp/monitor-out.json
 
   aws logs tail /aws/lambda/$STACK --since 10m --region $REGION ${PROFILE:+--profile $PROFILE}
 
-When the output looks right:  ./deploy.sh $ENV_NAME false
+When the output looks right:  ${PROFILE:+PROFILE=$PROFILE }./deploy.sh $ENV_NAME false
 EOF
 else
   cat <<EOF
 
 LIVE. The next stale run posts to #slack-test.
-Back to dry run at any time:  ./deploy.sh $ENV_NAME
+Back to dry run at any time:  ${PROFILE:+PROFILE=$PROFILE }./deploy.sh $ENV_NAME
 EOF
 fi

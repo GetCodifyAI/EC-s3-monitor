@@ -139,9 +139,13 @@ Resources:
       Runtime: python3.12
       Handler: monitor.lambda_handler
       Role: !GetAtt MonitorRole.Arn
-      # Listing is a handful of API calls; the default 128 MB is plenty. The
-      # timeout is generous only so a slow SSM or Slack call cannot truncate a run.
-      MemorySize: 128
+      # 128 MB measured at 101 MB peak - 79% - and almost all of that is the
+      # Python runtime plus boto3 rather than anything that scales with the
+      # data. That leaves too little headroom for a future runtime or boto3
+      # getting heavier, and an OOM here is the failure mode you discover by
+      # NOT being alerted. At ~30 invocations a month the difference is
+      # fractions of a cent.
+      MemorySize: 256
       Timeout: 60
       Code: src/
       Environment:
@@ -209,5 +213,5 @@ Outputs:
   Watching:
     Value: !Sub "s3://${MonitoredBucket}/ - ${FeedsJson}"
   Mode:
-    Description: DryRun true means nothing reaches Slack.
+    Description: Value of DryRun. true means nothing reaches Slack; false means it posts.
     Value: !Ref DryRun

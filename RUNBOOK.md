@@ -166,12 +166,44 @@ mode. The script, in order:
 may not be allowed to create roles. Re-run the first deploy with the break-glass
 role, which has a 1-hour session:
 
+This is not hypothetical - it is what happens on a first deploy. The exact
+error is a 403 on `iam:CreateRole`, wrapped in a confusing
+`UnauthorizedTaggingOperation` message; ignore the tagging part and read the
+inner reason.
+
+Add a `non-prod-admin` profile if you do not have one. It reuses the existing
+`sso-session`, so only the profile block is new:
+
 ```bash
-aws sso login --profile non-prod-admin      # sso_role_name = NonProdAdmin
-AWS_PROFILE=non-prod-admin ./deploy.sh nonprod
+printf '\n[profile non-prod-admin]\nsso_session = non-prod-sso\nsso_account_id = 147723036280\nsso_role_name = NonProdAdmin\nregion = us-east-2\noutput = json\n' >> ~/.aws/config
+aws configure list-profiles
 ```
 
-Once the role exists, subsequent deploys work under `NonProdDeveloper` again.
+Check `list-profiles` succeeds before going on - a malformed `~/.aws/config`
+breaks every AWS command, not just this one.
+
+A failed CREATE leaves the stack in `ROLLBACK_COMPLETE`, which cannot be
+updated. Delete it, then deploy under the admin role:
+
+```bash
+aws cloudformation delete-stack --stack-name s3-staleness-monitor
+aws cloudformation wait stack-delete-complete --stack-name s3-staleness-monitor
+
+aws sso login --profile non-prod-admin
+PROFILE=non-prod-admin ./deploy.sh nonprod
+```
+
+`PROFILE=` in front of the command, not `AWS_PROFILE=` - `deploy.sh` sources
+`PROFILE` from `env/<name>.env` and an override has to use the same name to
+win. The account guard still applies, so this cannot land in the wrong account.
+
+Once the role exists, every later deploy works under `NonProdDeveloper` again.
+The NonProdAdmin session is only 1 hour, so do not leave it half-finished.
+
+**The better long-term fix** is a scoped deploy policy attached to
+`NonProdDeveloper` rather than break-glass every time the role changes. The
+previous implementation in this repo had one - recover it with
+`git show 08593eb:cfn/deploy-policy.json` - and ask #platform to attach it.
 
 ---
 
@@ -180,8 +212,7 @@ Once the role exists, subsequent deploys work under `NonProdDeveloper` again.
 Run it on demand rather than waiting for 08:00:
 
 ```bash
-aws lambda invoke --function-name s3-staleness-monitor \
-  /dev/stdout | python3 -m json.tool
+aws lambda invoke --function-name s3-staleness-monitor /tmp/monitor-out.json > /dev/null && python3 -m json.tool /tmp/monitor-out.json
 ```
 
 You are looking for four things:
@@ -233,8 +264,7 @@ Read the wording. This is the last cheap moment to change it.
 Only `DryRun` changes. Invoke once to confirm:
 
 ```bash
-aws lambda invoke --function-name s3-staleness-monitor \
-  /dev/stdout | python3 -m json.tool
+aws lambda invoke --function-name s3-staleness-monitor /tmp/monitor-out.json > /dev/null && python3 -m json.tool /tmp/monitor-out.json
 ```
 
 If the prefix is currently stale, a message appears in #slack-test within a
@@ -253,20 +283,32 @@ three days, and **do not put probe files into the prefix** — the bucket has
 
 Temporarily lower the threshold instead, so the current contents read as stale:
 
-Whatever `elapsed_days` showed in step 6, set the threshold below it:
+Lowering `StaleDays` only works when the newest file is already older than the
+floor of 1 day. When the prefix has a file from today it cannot fire, so make
+the monitor look at something that genuinely has nothing in it instead. Setting
+a suffix that matches no object is the cleanest way - it touches no data, and
+the prefix, the bucket and the schedule all stay exactly as they are:
 
 ```bash
-sed -i.bak 's/^STALE_DAYS=3/STALE_DAYS=1/' env/nonprod.env
+sed -i.bak 's/^OBJECT_SUFFIX=$/OBJECT_SUFFIX=.no-such-suffix/' env/nonprod.env
 ./deploy.sh nonprod false
-aws lambda invoke --function-name s3-staleness-monitor /dev/stdout | python3 -m json.tool
+aws lambda invoke --function-name s3-staleness-monitor /tmp/monitor-out.json > /dev/null && python3 -m json.tool /tmp/monitor-out.json
 ```
 
-The message should land in #slack-test within a second or two. Then put it back:
+Zero objects match, which reads as "no file has ever landed here" - past any
+threshold - so it alerts. That exercises the entire delivery path: schedule,
+IAM role, SSM lookup, webhook, and the message itself.
+
+Put it back and confirm the next run is silent again:
 
 ```bash
 mv env/nonprod.env.bak env/nonprod.env
 ./deploy.sh nonprod false
+aws lambda invoke --function-name s3-staleness-monitor /tmp/monitor-out.json > /dev/null && python3 -m json.tool /tmp/monitor-out.json
 ```
+
+The `feeds[0].objects` count should return to its real value and `status` to
+`OK`. If it does not, the suffix did not get reset - check `env/nonprod.env`.
 
 Check the message renders properly in Slack — the bold prefix name, the
 backticked path, the timestamp in the right timezone. Then put the threshold
@@ -279,7 +321,7 @@ back and confirm the next invoke is silent.
 **Run it now**
 
 ```bash
-aws lambda invoke --function-name s3-staleness-monitor /dev/stdout | python3 -m json.tool
+aws lambda invoke --function-name s3-staleness-monitor /tmp/monitor-out.json > /dev/null && python3 -m json.tool /tmp/monitor-out.json
 ```
 
 **See the last week of runs**
