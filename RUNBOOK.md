@@ -212,8 +212,7 @@ previous implementation in this repo had one - recover it with
 Run it on demand rather than waiting for 08:00:
 
 ```bash
-aws lambda invoke --function-name s3-staleness-monitor \
-  /dev/stdout | python3 -m json.tool
+aws lambda invoke --function-name s3-staleness-monitor /tmp/monitor-out.json > /dev/null && python3 -m json.tool /tmp/monitor-out.json
 ```
 
 You are looking for four things:
@@ -265,8 +264,7 @@ Read the wording. This is the last cheap moment to change it.
 Only `DryRun` changes. Invoke once to confirm:
 
 ```bash
-aws lambda invoke --function-name s3-staleness-monitor \
-  /dev/stdout | python3 -m json.tool
+aws lambda invoke --function-name s3-staleness-monitor /tmp/monitor-out.json > /dev/null && python3 -m json.tool /tmp/monitor-out.json
 ```
 
 If the prefix is currently stale, a message appears in #slack-test within a
@@ -294,7 +292,7 @@ the prefix, the bucket and the schedule all stay exactly as they are:
 ```bash
 sed -i.bak 's/^OBJECT_SUFFIX=$/OBJECT_SUFFIX=.no-such-suffix/' env/nonprod.env
 ./deploy.sh nonprod false
-aws lambda invoke --function-name s3-staleness-monitor /dev/stdout | python3 -m json.tool
+aws lambda invoke --function-name s3-staleness-monitor /tmp/monitor-out.json > /dev/null && python3 -m json.tool /tmp/monitor-out.json
 ```
 
 Zero objects match, which reads as "no file has ever landed here" - past any
@@ -306,7 +304,7 @@ Put it back and confirm the next run is silent again:
 ```bash
 mv env/nonprod.env.bak env/nonprod.env
 ./deploy.sh nonprod false
-aws lambda invoke --function-name s3-staleness-monitor /dev/stdout | python3 -m json.tool
+aws lambda invoke --function-name s3-staleness-monitor /tmp/monitor-out.json > /dev/null && python3 -m json.tool /tmp/monitor-out.json
 ```
 
 The `feeds[0].objects` count should return to its real value and `status` to
@@ -323,7 +321,7 @@ back and confirm the next invoke is silent.
 **Run it now**
 
 ```bash
-aws lambda invoke --function-name s3-staleness-monitor /dev/stdout | python3 -m json.tool
+aws lambda invoke --function-name s3-staleness-monitor /tmp/monitor-out.json > /dev/null && python3 -m json.tool /tmp/monitor-out.json
 ```
 
 **See the last week of runs**

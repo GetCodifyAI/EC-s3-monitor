@@ -158,17 +158,16 @@ if [[ "$DRY_RUN" == "true" ]]; then
 Deployed in DRY RUN. Nothing will reach Slack.
 Run it now and read what it would have posted:
 
-  aws lambda invoke --function-name $STACK --region $REGION \\
-    ${PROFILE:+--profile $PROFILE }/dev/stdout | python3 -m json.tool
+  aws lambda invoke --function-name $STACK --region $REGION ${PROFILE:+--profile $PROFILE }/tmp/monitor-out.json > /dev/null && python3 -m json.tool /tmp/monitor-out.json
 
   aws logs tail /aws/lambda/$STACK --since 10m --region $REGION ${PROFILE:+--profile $PROFILE}
 
-When the output looks right:  ./deploy.sh $ENV_NAME false
+When the output looks right:  ${PROFILE:+PROFILE=$PROFILE }./deploy.sh $ENV_NAME false
 EOF
 else
   cat <<EOF
 
 LIVE. The next stale run posts to #slack-test.
-Back to dry run at any time:  ./deploy.sh $ENV_NAME
+Back to dry run at any time:  ${PROFILE:+PROFILE=$PROFILE }./deploy.sh $ENV_NAME
 EOF
 fi
